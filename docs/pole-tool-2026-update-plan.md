@@ -206,6 +206,29 @@ Real defects found while reading, independent of the new features:
 | `pole_coords[pid]` raises `KeyError` on any mismatch | `Wood_Pole_Replacement.py:283` | `.get()` with blank fallback |
 | Empty pole selection produces a confusing downstream failure | — | Guard and exit with a clear message |
 
+**Blank answers explain themselves.** `"No"` currently means three different things: a genuine
+non-overlap, a layer that downloaded zero features, and a layer that failed. For a county or
+township lookup it is never a real answer — every structure is in some county — so a silent
+`"No"` there hides a broken layer.
+
+Root cause found in the field: `ensure_feature_layer()` calls `SelectLayerByLocation` then
+`CopyFeatures`, and **`CopyFeatures` succeeds on an empty selection**. A streaming layer whose
+spatial selection silently fails returns zero features, every join misses, and every cell reads
+`"No"`. An empty download is now treated as a failed strategy so it falls through to the next
+one, and the answers are separated:
+
+| Cell reads | Means |
+|---|---|
+| `No` | genuinely no overlap |
+| `Layer empty` | the layer returned zero features in the project area |
+| `No match - see Run Log` | a statewide lookup matched no structure at all — almost certainly wrong |
+| `Layer failed - see Run Log` | the layer raised, and was skipped |
+| `Incomplete - <layer> unreadable` | SESC, where one of the chosen water layers could not be read |
+
+These are grey-filled and italic red, so they never read as a clean result at a glance. The Run
+Log gains a feature count and an `N of M structures matched` line per layer, plus a note when a
+layer is reprojected on the fly.
+
 **Workbook structure** becomes three sheets:
 
 - `Pole Matrix` — Pole_ID, Latitude, Longitude, Height, Install_Date, Structure_Type, County,

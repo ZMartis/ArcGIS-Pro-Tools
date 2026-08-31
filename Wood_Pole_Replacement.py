@@ -75,6 +75,14 @@ def layer_title(layer):
     return str(getattr(layer, "name", layer))
 
 
+def feature_count(source):
+    """How many features a layer holds, or None if it cannot be counted."""
+    try:
+        return int(arcpy.management.GetCount(source)[0])
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Field resolution
 #
@@ -313,7 +321,10 @@ def ensure_feature_layer(layer, scratch_gdb, aoi_features=None, aoi_extent_fc=No
                     sel, "INTERSECT", aoi_fc,
                     selection_type="NEW_SELECTION" if i == 0 else "ADD_TO_SELECTION",
                 )
-            return arcpy.management.CopyFeatures(sel, output_fc)[0]
+            copied = arcpy.management.CopyFeatures(sel, output_fc)[0]
+            if feature_count(copied) == 0:
+                raise ValueError("selection returned 0 features")
+            return copied
         finally:
             if arcpy.Exists(sel):
                 arcpy.management.Delete(sel)
@@ -447,16 +458,18 @@ def get_intersect_hits(target, join_layer, id_field, label_fields, scratch_gdb, 
     return hits
 
 
-def format_result(hits, pid, index=None):
+def format_result(hits, pid, index=None, default="No"):
     """
     Render one pole's hits as a cell value.
 
     `index` picks a single field out of each tuple — that is how soil ends up as
     separate symbol and name columns. Without it, all fields are joined.
+    `default` is what a structure with no hit prints, so a lookup that matched
+    nothing can say so rather than printing a plausible-looking "No".
     """
     values = hits.get(pid)
     if not values:
-        return "No"
+        return default
 
     if index is None:
         rendered = {VALUE_SEP.join(v for v in tup if v) for tup in values}
@@ -464,7 +477,28 @@ def format_result(hits, pid, index=None):
         rendered = {tup[index] for tup in values if index < len(tup) and tup[index]}
 
     rendered = sorted(v for v in rendered if v)
-    return ", ".join(rendered) if rendered else "No"
+    return ", ".join(rendered) if rendered else default
+
+
+def check_layer(local, title):
+    """Log what a layer brought to the project area, and whether it lines up with the poles."""
+    count = feature_count(local)
+    if count == 0:
+        log("Warning", title,
+            "0 features in the project area - every answer from this layer will be blank. "
+            "Check that the service is reachable and covers the project.")
+    else:
+        log("Layer", title, f"{count} feature(s) in the project area")
+
+    try:
+        their_sr = arcpy.Describe(local).spatialReference
+        if their_sr.factoryCode and pole_sr.factoryCode and their_sr.factoryCode != pole_sr.factoryCode:
+            log("Layer", title,
+                f"projected on the fly from {their_sr.name} to {pole_sr.name}")
+    except Exception:
+        pass
+
+    return count
 
 
 def analyze(layer, title, target, id_field, role=None, preferred=None, want=1, multi_id=False):
@@ -472,13 +506,37 @@ def analyze(layer, title, target, id_field, role=None, preferred=None, want=1, m
     local = ensure_feature_layer(
         layer, gdb, aoi_features=aoi_features, aoi_extent_fc=aoi_extent_fc
     )
+    count = check_layer(local, title)
     fields, provenance = resolve_fields(
         layer, title, local,
         role=role or infer_role(title),
         preferred=preferred, want=want, overrides=overrides,
     )
     log("Field", title, provenance)
-    return get_intersect_hits(target, local, id_field, fields, gdb, multi_id=multi_id), local
+    hits = get_intersect_hits(target, local, id_field, fields, gdb, multi_id=multi_id)
+    return hits, local, count
+
+
+def blank_answer(title, hits, count, expect_every_structure):
+    """
+    What to print when a structure has no hit, and a note when that looks wrong.
+
+    "No" is a real answer for a constraint layer and a meaningless one for an
+    administrative lookup — every structure sits in some county — so a lookup
+    that matched nothing says so instead of quietly reading as a clean result.
+    """
+    matched = sum(1 for pid in pole_ids if hits.get(pid))
+    log("Coverage", title, f"{matched} of {len(pole_ids)} structures matched")
+
+    if count == 0:
+        return "Layer empty"
+    if expect_every_structure and matched == 0:
+        log("Warning", title,
+            "no structure matched this layer, which should not happen for a lookup that "
+            "covers the whole state. Check the layer's extent, and the Run Log above for "
+            "which field was read.")
+        return "No match - see Run Log"
+    return "No"
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +644,7 @@ aoi_features = [aoi_buffer_dissolved, aoi_ar_dissolved]
 pole_ext = arcpy.Describe(sesc_target).extent
 ar_ext = arcpy.Describe(access_routes).extent
 sr = arcpy.Describe(sesc_target).spatialReference
+pole_sr = sr
 
 aoi_polygon = arcpy.Polygon(arcpy.Array([
     arcpy.Point(min(pole_ext.XMin, ar_ext.XMin), min(pole_ext.YMin, ar_ext.YMin)),
@@ -623,16 +682,22 @@ for layer, title, columns, role, preferred, want in POINT_ANALYSES:
     if not layer:
         continue
     try:
-        hits, _local = analyze(
+        hits, _local, count = analyze(
             layer, title, poles, pole_id_field, role=role, preferred=preferred, want=want
         )
+        # Parcels genuinely stop at the edge of a county's dataset; the rest are
+        # statewide layers where a miss means something is wrong.
+        default = blank_answer(title, hits, count, expect_every_structure=(role != "parcel"))
         for pid in pole_ids:
             for i, column in enumerate(columns):
                 results[pid][column] = format_result(
-                    hits, pid, index=i if len(columns) > 1 else None
+                    hits, pid, index=i if len(columns) > 1 else None, default=default
                 )
     except Exception as exc:
         log("Error", title, f"skipped - {exc}")
+        for pid in pole_ids:
+            for column in columns:
+                results[pid][column] = "Layer failed - see Run Log"
 
 # --- MDOT jurisdiction (work zone and access routes, since both enter the ROW) ---
 
@@ -647,15 +712,22 @@ if mdot_layer:
         )
         log("Field", "MDOT Jurisdiction", provenance)
 
+        count = check_layer(local, "MDOT Jurisdiction")
         hits_wz = get_intersect_hits(pole_buffer_60, local, pole_id_field, fields, gdb)
         hits_ar = get_intersect_hits(
             access_routes, local, ar_pole_id_field, fields, gdb, multi_id=True
         )
+        default = blank_answer(
+            "MDOT Jurisdiction", hits_wz, count, expect_every_structure=False
+        )
         for pid in pole_ids:
-            results[pid]["MDOT_Jurisdiction"] = format_result(hits_wz, pid)
-            results[pid]["AR_MDOT_Jurisdiction"] = format_result(hits_ar, pid)
+            results[pid]["MDOT_Jurisdiction"] = format_result(hits_wz, pid, default=default)
+            results[pid]["AR_MDOT_Jurisdiction"] = format_result(hits_ar, pid, default=default)
     except Exception as exc:
         log("Error", "MDOT Jurisdiction", f"skipped - {exc}")
+        for pid in pole_ids:
+            results[pid]["MDOT_Jurisdiction"] = "Layer failed - see Run Log"
+            results[pid]["AR_MDOT_Jurisdiction"] = "Layer failed - see Run Log"
 
 # --- SESC ---
 #
@@ -665,6 +737,8 @@ if mdot_layer:
 
 if sesc_layers:
     sesc_hits = {pid: set() for pid in pole_ids}
+    sesc_empty = []
+    sesc_failed = []
     for layer in sesc_layers:
         title = layer_title(layer)
         try:
@@ -675,6 +749,9 @@ if sesc_layers:
                 layer, title, local, role=infer_role(title), overrides=overrides
             )
             log("Field", f"SESC / {title}", provenance)
+
+            if check_layer(local, f"SESC / {title}") == 0:
+                sesc_empty.append(title)
 
             type_field = find_field(
                 field_index(local),
@@ -689,10 +766,21 @@ if sesc_layers:
                     sesc_hits[pid] |= values
         except Exception as exc:
             log("Error", f"SESC / {title}", f"skipped - {exc}")
+            sesc_failed.append(title)
+
+    # A clean SESC result is only trustworthy if every chosen layer was readable.
+    unusable = sesc_empty + sesc_failed
+    if unusable:
+        log("Warning", "SESC",
+            f"{len(unusable)} of {len(sesc_layers)} layer(s) returned nothing "
+            f"({', '.join(unusable)}); a 'No' below is not a clean result")
+        clean = f"Incomplete - {', '.join(unusable)} unreadable"
+    else:
+        clean = "No"
 
     for pid in pole_ids:
-        results[pid]["SESC_Trigger"] = "Yes" if sesc_hits[pid] else "No"
-        results[pid]["SESC_Features"] = format_result(sesc_hits, pid)
+        results[pid]["SESC_Trigger"] = "Yes" if sesc_hits[pid] else clean
+        results[pid]["SESC_Features"] = format_result(sesc_hits, pid, default=clean)
 
 # --- Constraint layers ---
 
@@ -708,19 +796,27 @@ for constraint in constraint_layers:
         )
         log("Field", constraint_name, provenance)
 
+        count = check_layer(local, constraint_name)
         hits_60 = get_intersect_hits(pole_buffer_60, local, pole_id_field, fields, gdb)
         hits_ar = get_intersect_hits(
             access_routes, local, ar_pole_id_field, fields, gdb, multi_id=True
         )
 
+        default = blank_answer(
+            constraint_name, hits_60, count, expect_every_structure=False
+        )
         for pid in pole_ids:
-            results[pid][f"60ft_Pole_{constraint_name}"] = format_result(hits_60, pid)
-            results[pid][f"AR_{constraint_name}"] = format_result(hits_ar, pid)
+            results[pid][f"60ft_Pole_{constraint_name}"] = format_result(
+                hits_60, pid, default=default
+            )
+            results[pid][f"AR_{constraint_name}"] = format_result(
+                hits_ar, pid, default=default
+            )
     except Exception as exc:
         log("Error", constraint_name, f"skipped - {exc}")
         for pid in pole_ids:
-            results[pid][f"60ft_Pole_{constraint_name}"] = "Layer failed"
-            results[pid][f"AR_{constraint_name}"] = "Layer failed"
+            results[pid][f"60ft_Pole_{constraint_name}"] = "Layer failed - see Run Log"
+            results[pid][f"AR_{constraint_name}"] = "Layer failed - see Run Log"
 
 # --- Two mile T&E review ---
 #
@@ -803,8 +899,15 @@ def is_hit_column(header):
     return header in ("MDOT_Jurisdiction", "SESC_Trigger", "SESC_Features")
 
 
+# Answers that mean "the tool could not tell you", which must not be mistaken
+# for a clean result at a glance.
+PROBLEM_ANSWERS = ("Layer empty", "Layer failed", "No match", "Incomplete")
+
+
 orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")
+grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 black_font = Font(color="000000", bold=True)
+problem_font = Font(color="9C0006", italic=True)
 
 wb = load_workbook(excel_path)
 ws = wb["Pole Matrix"]
@@ -813,15 +916,20 @@ headers = {cell.column: cell.value for cell in ws[1]}
 
 for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_column=ws.max_column):
     for cell in row:
-        if not is_hit_column(headers.get(cell.column, "")):
-            continue
-
         val = str(cell.value) if cell.value else ""
-        if not val or val in ("No", "Layer failed"):
+        if not val:
             continue
 
-        cell.fill = orange_fill
-        cell.font = black_font
+        # Checked on every column, because a county or soil lookup that could
+        # not be answered lands in an otherwise informational column.
+        if val.startswith(PROBLEM_ANSWERS):
+            cell.fill = grey_fill
+            cell.font = problem_font
+            continue
+
+        if val != "No" and is_hit_column(headers.get(cell.column, "")):
+            cell.fill = orange_fill
+            cell.font = black_font
 
 # Readable widths — the name columns are much wider than the Yes/No they replaced.
 for sheet in wb.worksheets:

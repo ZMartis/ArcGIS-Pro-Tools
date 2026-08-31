@@ -135,6 +135,43 @@ check("name column", format_result(hits, "P1", index=1), "Miami loam, Miami sand
 check("no hit", format_result(hits, "P2"), "No")
 check("absent pole", format_result(hits, "P9"), "No")
 
+print("\n== Blank answers say why they are blank ==")
+# "No" is a real answer for a constraint layer and a meaningless one for a
+# county lookup, so the two must not print the same thing.
+blank_answer = ns["blank_answer"]
+ns["pole_ids"] = ["P1", "P2", "P3"]
+
+check("statewide lookup that matched nothing flags itself",
+      blank_answer("County", {}, count=42, expect_every_structure=True),
+      "No match - see Run Log")
+check("empty layer is named as empty",
+      blank_answer("County", {}, count=0, expect_every_structure=True),
+      "Layer empty")
+check("empty beats no-match when both are true",
+      blank_answer("County", {}, count=0, expect_every_structure=False),
+      "Layer empty")
+check("constraint layer with no hits is a real No",
+      blank_answer("Cemeteries", {}, count=17, expect_every_structure=False),
+      "No")
+check("partial coverage is still a real No",
+      blank_answer("County", {"P1": {("Kent",)}}, count=42, expect_every_structure=True),
+      "No")
+
+check("default reaches the cell",
+      format_result({}, "P1", default="Layer empty"), "Layer empty")
+check("default does not override a real hit",
+      format_result({"P1": {("Kent",)}}, "P1", default="Layer empty"), "Kent")
+check("a hit whose name is blank still reads as a hit",
+      format_result({"P1": {("Yes",)}}, "P1", default="Layer empty"), "Yes")
+
+print("\n== Problem answers are styled, not mistaken for results ==")
+problems = ["Layer empty", "Layer failed - see Run Log", "No match - see Run Log",
+            "Incomplete - NWI Wetlands unreadable"]
+prefixes = ("Layer empty", "Layer failed", "No match", "Incomplete")
+check("every diagnostic string is recognised",
+      all(v.startswith(prefixes) for v in problems), True)
+check("a real answer is not", any(v.startswith(prefixes) for v in ["No", "Kent", "Yes"]), False)
+
 print("\n== Pole ID parsing ==")
 check("comma list", _parse_ids(" 101, 102 ,103 ", True), ["101", "102", "103"])
 check("single is stringified", _parse_ids(1042, False), ["1042"])
