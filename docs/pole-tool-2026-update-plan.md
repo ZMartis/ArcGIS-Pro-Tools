@@ -101,18 +101,24 @@ Implementation notes:
 
 ---
 
-## 4. Buffer change: 100 ft → 500 ft
+## 4. Buffer change: 100 ft → 500 ft, for SESC only
 
-- `pole_buffer_100` → `pole_buffer_500`, `"100 Feet"` → `"500 Feet"`
-  (`Wood_Pole_Replacement.py:193`).
-- Column prefix `100ft_Pole_` → `500ft_Pole_` — also update the Excel formatting branch at
-  `Wood_Pole_Replacement.py:315`, which string-matches that prefix.
-- Derived output parameter (`Wood_Pole_Replacement.py:351`) now returns the 500 ft buffer.
-- The AOI used to download streaming layers is built from this buffer
-  (`Wood_Pole_Replacement.py:209`), so downloads get bigger. The existing two-stage
-  optimization (run the big buffer first, then test 60 ft only against features that already
-  hit) stays and matters more now.
-- `"Same as 60ft"` collapsing logic is unaffected.
+The 500 ft buffer replaces the 100 ft buffer as geometry, but not as an analysis. It exists to
+answer one question — the SESC check in §6 — and nothing else is measured against it.
+
+- `pole_buffer_100` → `pole_buffer_500`, `"100 Feet"` → `"500 Feet"`.
+- **The `100ft_Pole_*` columns go away rather than becoming `500ft_Pole_*`.** Constraint layers
+  are a work-zone question: each one produces a `60ft_Pole_*` and an `AR_*` column, and that is
+  all. A county road ROW 300 ft from the structure is not a constraint on the job.
+- This drops the second spatial join per constraint layer, so the constraint loop gets
+  meaningfully faster, and the `"Same as 60ft"` collapsing logic is no longer needed.
+- The wide-buffer highlighting in the Excel formatter (yellow fill, bolding features the wider
+  buffer found that the work zone did not) goes with those columns. Hit columns are orange,
+  informational columns are plain.
+- Derived output parameter still returns the 500 ft buffer, so it lands in the Contents pane
+  where the 100 ft buffer used to.
+- The AOI used to download streaming layers is built from the widest buffer in play, since SESC
+  still needs water and wetland data out to 500 ft.
 
 ---
 
@@ -192,19 +198,43 @@ Real defects found while reading, independent of the new features:
 
 | Issue | Location | Fix |
 |---|---|---|
-| Hardcoded `min_col=4` in the Excel formatter — silently mis-colors once Height/Install/Type/County/etc. columns are added | `Wood_Pole_Replacement.py:306` | Compute the first constraint column from the header row |
+| Hardcoded `min_col=4` in the Excel formatter — silently mis-colors once Height/Install/Type/County/etc. columns are added | `Wood_Pole_Replacement.py:306` | Classify each column from its header instead of assuming a start position |
 | `constraint_100ft_sel` feature layer leaks if `get_intersect_hits` raises | `Wood_Pole_Replacement.py:254` | `try/finally` cleanup |
 | Inconsistent pole-ID key types — buffers key on raw `row[0]`, access routes on `str(pid).strip()` | `Wood_Pole_Replacement.py:263-277` | Normalize every ID to a stripped string once, at read time |
 | One bad constraint layer kills the whole run | constraint loop, `Wood_Pole_Replacement.py:236` | Per-layer `try/except`; record failures and keep going |
 | Duplicate pole IDs silently collapse in `pole_coords` | `Wood_Pole_Replacement.py:199` | Warn on duplicates |
 | `pole_coords[pid]` raises `KeyError` on any mismatch | `Wood_Pole_Replacement.py:283` | `.get()` with blank fallback |
 | Empty pole selection produces a confusing downstream failure | — | Guard and exit with a clear message |
+| `iter_rows()` takes `max_col`, but `ws.cell()` takes `column` — mixing them up raises only at the very end of a run, after every spatial join is already paid for | Excel formatter | Fixed, plus a static AST check in the test suite that validates openpyxl keyword names without needing openpyxl installed |
+
+**Blank answers explain themselves.** `"No"` currently means three different things: a genuine
+non-overlap, a layer that downloaded zero features, and a layer that failed. For a county or
+township lookup it is never a real answer — every structure is in some county — so a silent
+`"No"` there hides a broken layer.
+
+Root cause found in the field: `ensure_feature_layer()` calls `SelectLayerByLocation` then
+`CopyFeatures`, and **`CopyFeatures` succeeds on an empty selection**. A streaming layer whose
+spatial selection silently fails returns zero features, every join misses, and every cell reads
+`"No"`. An empty download is now treated as a failed strategy so it falls through to the next
+one, and the answers are separated:
+
+| Cell reads | Means |
+|---|---|
+| `No` | genuinely no overlap |
+| `Layer empty` | the layer returned zero features in the project area |
+| `No match - see Run Log` | a statewide lookup matched no structure at all — almost certainly wrong |
+| `Layer failed - see Run Log` | the layer raised, and was skipped |
+| `Incomplete - <layer> unreadable` | SESC, where one of the chosen water layers could not be read |
+
+These are grey-filled and italic red, so they never read as a clean result at a glance. The Run
+Log gains a feature count and an `N of M structures matched` line per layer, plus a note when a
+layer is reprojected on the fly.
 
 **Workbook structure** becomes three sheets:
 
 - `Pole Matrix` — Pole_ID, Latitude, Longitude, Height, Install_Date, Structure_Type, County,
   Township_City, Sec_Twp_Rng, Soil_Symbol, Soil_Name, Parcel, MDOT_Jurisdiction, SESC_Trigger,
-  SESC_Features, then the 60ft/500ft/AR constraint columns.
+  SESC_Features, then a `60ft_Pole_*` and `AR_*` pair per constraint layer.
 - `T&E_2mi` — only when enabled.
 - `Run_Log` — which field was chosen for each layer and how it was chosen, plus any layer
   failures. This is what turns a wrong guess into a two-second override instead of a mystery.
