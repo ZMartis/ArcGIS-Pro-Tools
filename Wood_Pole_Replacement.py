@@ -4,13 +4,13 @@ Wood Pole Replacement — constraint matrix tool for ArcGIS Pro.
 2026 update:
   * 2026 streaming structure layer field names (StructureN / Latitude / Longitude),
     plus Height1, Installati and Structure T carried into the matrix.
-  * 100 ft buffer replaced by 500 ft.
   * Constraint layers report the intersecting feature's name instead of "Yes",
     resolved by an override -> known alias -> label expression -> heuristic ladder.
   * Named-layer analyses: county, township/city, section-township-range,
     MDOT jurisdiction, soil, parcel.
-  * SESC check driven off the 500 ft pole buffer against a chosen set of
-    water / wetland / county drain layers.
+  * The 100 ft buffer is replaced by a 500 ft buffer used solely for the SESC
+    check, against a per-county choice of water / wetland / county drain layers.
+    Every other overlap stays a question about the 60 ft work zone.
   * Optional project-wide 2 mile MNFI T&E review.
 
 Toolbox parameters are listed in docs/pole-tool-2026-update-plan.md, section 9.
@@ -22,8 +22,6 @@ import re
 import pandas as pd
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl import load_workbook
-from openpyxl.cell.text import InlineFont
-from openpyxl.cell.rich_text import CellRichText, TextBlock
 
 arcpy.env.overwriteOutput = True
 
@@ -514,6 +512,8 @@ if overrides:
 pole_buffer_60 = os.path.join(gdb, "PoleBuffer_60ft")
 arcpy.analysis.Buffer(poles, pole_buffer_60, "60 Feet", dissolve_option="NONE")
 
+# The work zone: everything except SESC is a question about this buffer.
+# The 500 ft buffer below is used only for the SESC check.
 pole_buffer_500 = os.path.join(gdb, "PoleBuffer_500ft")
 arcpy.analysis.Buffer(poles, pole_buffer_500, "500 Feet", dissolve_option="NONE")
 
@@ -708,43 +708,18 @@ for constraint in constraint_layers:
         )
         log("Field", constraint_name, provenance)
 
-        # Run 500 ft first — only features that intersect the larger buffer can
-        # intersect the smaller one, so the 60 ft pass works off a subset.
-        hits_500 = get_intersect_hits(pole_buffer_500, local, pole_id_field, fields, gdb)
-
-        if hits_500:
-            sel = temp_name("constraint_500ft_sel")
-            try:
-                arcpy.management.MakeFeatureLayer(local, sel)
-                arcpy.management.SelectLayerByLocation(sel, "INTERSECT", pole_buffer_500)
-                hits_60 = get_intersect_hits(pole_buffer_60, sel, pole_id_field, fields, gdb)
-            finally:
-                if arcpy.Exists(sel):
-                    arcpy.management.Delete(sel)
-        else:
-            hits_60 = {}
-
+        hits_60 = get_intersect_hits(pole_buffer_60, local, pole_id_field, fields, gdb)
         hits_ar = get_intersect_hits(
             access_routes, local, ar_pole_id_field, fields, gdb, multi_id=True
         )
 
         for pid in pole_ids:
             results[pid][f"60ft_Pole_{constraint_name}"] = format_result(hits_60, pid)
-
-            set_60 = hits_60.get(pid, set())
-            set_500 = hits_500.get(pid, set())
-            if set_500 and set_500 <= set_60:
-                # The wider buffer found nothing the work zone did not already hit.
-                results[pid][f"500ft_Pole_{constraint_name}"] = "Same as 60ft"
-            else:
-                results[pid][f"500ft_Pole_{constraint_name}"] = format_result(hits_500, pid)
-
             results[pid][f"AR_{constraint_name}"] = format_result(hits_ar, pid)
     except Exception as exc:
         log("Error", constraint_name, f"skipped - {exc}")
         for pid in pole_ids:
             results[pid][f"60ft_Pole_{constraint_name}"] = "Layer failed"
-            results[pid][f"500ft_Pole_{constraint_name}"] = "Layer failed"
             results[pid][f"AR_{constraint_name}"] = "Layer failed"
 
 # --- Two mile T&E review ---
@@ -819,64 +794,34 @@ with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
     pd.DataFrame(RUN_LOG).to_excel(writer, sheet_name="Run Log", index=False)
 
 
-def column_kind(header):
-    """How a column is highlighted: the wide buffer, a constraint hit, or plain info."""
+def is_hit_column(header):
+    """True for columns that report an overlap, as opposed to plain information."""
     if not header:
-        return "info"
-    if header.startswith("500ft_Pole_"):
-        return "wide"
+        return False
     if header.startswith("60ft_Pole_") or header.startswith("AR_"):
-        return "hit"
-    if header in ("MDOT_Jurisdiction", "SESC_Trigger", "SESC_Features"):
-        return "hit"
-    return "info"
+        return True
+    return header in ("MDOT_Jurisdiction", "SESC_Trigger", "SESC_Features")
 
 
 orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")
-yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
 black_font = Font(color="000000", bold=True)
-bold_inline = InlineFont(b=True)
-regular_inline = InlineFont()
 
 wb = load_workbook(excel_path)
 ws = wb["Pole Matrix"]
 
 headers = {cell.column: cell.value for cell in ws[1]}
-header_to_col = {cell.value: cell.column for cell in ws[1]}
 
 for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_column=ws.max_column):
     for cell in row:
-        header = headers.get(cell.column, "")
-        kind = column_kind(header)
-        if kind == "info":
+        if not is_hit_column(headers.get(cell.column, "")):
             continue
 
         val = str(cell.value) if cell.value else ""
-        if not val or val in ("No", "Same as 60ft", "Layer failed"):
+        if not val or val in ("No", "Layer failed"):
             continue
 
-        if kind == "wide":
-            # Bold whatever the wider buffer found that the work zone did not.
-            sixty_col = header_to_col.get(f"60ft_Pole_{header[len('500ft_Pole_'):]}")
-            sixty_features = set()
-            if sixty_col:
-                sixty_val = ws.cell(row=cell.row, column=sixty_col).value
-                if sixty_val and str(sixty_val) != "No":
-                    sixty_features = {f.strip() for f in str(sixty_val).split(", ")}
-
-            parts = []
-            for j, feature in enumerate(f.strip() for f in val.split(", ")):
-                if j > 0:
-                    parts.append(TextBlock(regular_inline, ", "))
-                parts.append(TextBlock(
-                    bold_inline if feature not in sixty_features else regular_inline, feature
-                ))
-
-            cell.value = CellRichText(*parts)
-            cell.fill = yellow_fill
-        else:
-            cell.fill = orange_fill
-            cell.font = black_font
+        cell.fill = orange_fill
+        cell.font = black_font
 
 # Readable widths — the name columns are much wider than the Yes/No they replaced.
 for sheet in wb.worksheets:
