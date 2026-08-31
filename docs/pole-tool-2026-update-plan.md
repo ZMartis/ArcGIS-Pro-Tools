@@ -205,6 +205,7 @@ Real defects found while reading, independent of the new features:
 | Duplicate pole IDs silently collapse in `pole_coords` | `Wood_Pole_Replacement.py:199` | Warn on duplicates |
 | `pole_coords[pid]` raises `KeyError` on any mismatch | `Wood_Pole_Replacement.py:283` | `.get()` with blank fallback |
 | Empty pole selection produces a confusing downstream failure | — | Guard and exit with a clear message |
+| `iter_rows()` takes `max_col`, but `ws.cell()` takes `column` — mixing them up raises only at the very end of a run, after every spatial join is already paid for | Excel formatter | Fixed, plus a static AST check in the test suite that validates openpyxl keyword names without needing openpyxl installed |
 
 **Blank answers explain themselves.** `"No"` currently means three different things: a genuine
 non-overlap, a layer that downloaded zero features, and a layer that failed. For a county or

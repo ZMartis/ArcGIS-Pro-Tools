@@ -198,5 +198,30 @@ check("2024 Latitude still resolves", find_field(lidx, ["Latitude", "Structures_
       "Structures_Latitude")
 check("2024 Height absent -> None", find_field(lidx, ["Height1", "Height"]), None)
 
+print("\n== openpyxl call signatures ==")
+# iter_rows takes max_col; ws.cell() takes column. Mixing them up raises only at
+# the very end of a run, after every spatial join has already been paid for, so
+# check it statically instead.
+import ast
+
+OPENPYXL_KWARGS = {
+    "iter_rows": {"min_row", "max_row", "min_col", "max_col", "values_only"},
+    "iter_cols": {"min_col", "max_col", "min_row", "max_row", "values_only"},
+    "cell": {"row", "column", "value"},
+}
+
+bad = []
+for node in ast.walk(ast.parse(source)):
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        continue
+    allowed = OPENPYXL_KWARGS.get(node.func.attr)
+    if allowed is None:
+        continue
+    for kw in node.keywords:
+        if kw.arg and kw.arg not in allowed:
+            bad.append(f"line {node.lineno}: {node.func.attr}({kw.arg}=...)")
+
+check("no invalid openpyxl keyword arguments", bad, [])
+
 print(f"\n{'ALL PASS' if not failures else str(len(failures)) + ' FAILURE(S): ' + ', '.join(failures)}")
 sys.exit(1 if failures else 0)

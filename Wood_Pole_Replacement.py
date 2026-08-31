@@ -914,7 +914,7 @@ ws = wb["Pole Matrix"]
 
 headers = {cell.column: cell.value for cell in ws[1]}
 
-for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_column=ws.max_column):
+for row in ws.iter_rows(min_row=2):
     for cell in row:
         val = str(cell.value) if cell.value else ""
         if not val:
